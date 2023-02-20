@@ -1,6 +1,11 @@
+import fs from "fs";
+import os from "os";
+import { v4 } from "uuid";
+import process from "process";
+
 import qrcode from "qrcode-terminal";
 import { Client, Message, Events } from "whatsapp-web.js";
-import { startsWithIgnoreCase } from "./utils";
+import { startsWithIgnoreCase, parseWhisperResult, execSync } from "./utils";
 
 // Config & Constants
 import config from "./config";
@@ -44,6 +49,48 @@ async function handleIncomingMessage(message: Message) {
 	}
 }
 
+async function handleIncomingVoiceMessage(message: Message) {
+	const media = await message.downloadMedia();
+
+	message.reply("Processing voice message...");
+
+	// Media base64 data to buffer
+	const buffer = Buffer.from(media.data, "base64");
+
+	// Write the buffer into a temp file
+	const tempFile = os.tmpdir() + "/" + v4() + ".ogg";
+	fs.writeFileSync(tempFile, buffer);
+
+	// Transcribe using the whisper command
+	const whisperResult = await execSync(`whisper --task transcribe --fp16 False ${tempFile}`);
+
+	// Delete the temp file
+	fs.unlinkSync(tempFile);
+
+	// Remove all .ogg.* files (whisper creates a bunch of temp files)
+	try {
+		const regex = /\.ogg\..*$/;
+		const files = fs.readdirSync(process.cwd());
+
+		for (const file of files) {
+			if (regex.test(file)) {
+				fs.unlinkSync(file);
+			}
+		}
+	} catch (error) {
+		console.error(error);
+	}
+
+	// Parse out the actual text and language
+	const { language, text } = parseWhisperResult(whisperResult);
+
+	// Reply with the text and language
+	message.reply("You said: " + text + " (language: " + language + ")");
+
+	// Send it to GPT
+	await handleMessageGPT(message, text as string);
+}
+
 // Entrypoint
 const start = async () => {
 	cli.printIntro();
@@ -68,18 +115,20 @@ const start = async () => {
 	});
 
 	// WhatsApp message
-	client.on(Events.MESSAGE_RECEIVED, async (message: any) => {
+	client.on(Events.MESSAGE_RECEIVED, async (message: Message) => {
 		// Ignore if message is from status broadcast
 		if (message.from == constants.statusBroadcast) return;
-
-		// Ignore if message is empty or media
-		if (message.body.length == 0) return;
-		if (message.hasMedia) return;
 
 		// Ignore if it's a quoted message, (e.g. GPT reply)
 		if (message.hasQuotedMsg) return;
 
-		await handleIncomingMessage(message);
+		if (message.hasMedia) {
+			// Voice message
+			await handleIncomingVoiceMessage(message);
+		} else {
+			// Text message
+			await handleIncomingMessage(message);
+		}
 	});
 
 	// Reply to own message
@@ -87,17 +136,19 @@ const start = async () => {
 		// Ignore if message is from status broadcast
 		if (message.from == constants.statusBroadcast) return;
 
-		// Ignore if message is empty or media
-		if (message.body.length == 0) return;
-		if (message.hasMedia) return;
-
 		// Ignore if it's a quoted message, (e.g. GPT reply)
 		if (message.hasQuotedMsg) return;
 
 		// Ignore if it's not from me
 		if (!message.fromMe) return;
 
-		await handleIncomingMessage(message);
+		if (message.hasMedia) {
+			// Voice message
+			await handleIncomingVoiceMessage(message);
+		} else {
+			// Text message
+			await handleIncomingMessage(message);
+		}
 	});
 
 	// Whatsapp initialization
